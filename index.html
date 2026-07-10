@@ -334,8 +334,12 @@ const CONFIG = {
   // ---- RightHand — the lead is "声" (a voice): sustained, gliding ----
   // (per-voice tone — osc/filter/vibrato/attack/release/saturation/sends — lives in TIMBRES)
   leadLo: 44, leadHi: 90,       // playable midi range mapped to the vertical axis
-  leadMaxVoices: 6,             // cap on overlapping lead voices (rapid-tap tails) — steal oldest
-                                //    (lead is monophonic; normal play never reaches this — transparent)
+  leadMaxFingers: 4,            // how many voice-zone fingers sing at once (1 primary + N harmony)
+  dupOnsetRadius: 22,           // px — a 2nd touch landing this close to a just-placed finger is a
+  dupOnsetMs: 80,               //   hardware ghost (fingers can't sit <~40px apart), if within this
+                                //   long — ignore it, so one finger can't fire a phantom double note
+  leadMaxVoices: 9,             // cap on overlapping lead voices (held chord + rapid-tap tails)
+                                //    — steals the oldest FREE voice; a finger-held voice is never stolen
   leadPortamento: 0.06,         // glide time-constant for slides (legato)
   leadLeapSemitones: 3,         // a jump of >= this, made fast, re-articulates…
   leadLeapSpeed: 0.30,          // px/ms — …above this finger speed (else it glides)
@@ -906,6 +910,7 @@ function initiateRecording(){
     padVoices.forEach(v=>{ v.oscs.forEach(o=>{try{o.stop();}catch(_){}}); });
     padVoices=[];
     if(lead.voice){ try{releaseLead(lead.voice);}catch(_){} lead.voice=null; lead.pid=null; }
+    killExtras();
     suspended=false; temperature=0; outness=0; leadIntensity=0;
     chordIdx=0;
     // stick count-in immediately after fade
@@ -1981,14 +1986,25 @@ function createLeadVoice(midi,x01){
   leadVoices.push(v); capLeadVoices(v);
   return v;
 }
+/* is this voice currently under a finger (primary or a harmony finger)? such a voice
+   must never be stolen by the cap — the finger is still singing it. */
+function isHeldVoice(v){
+  if(lead.voice===v) return true;
+  for(const f of leadExtra.values()) if(f.voice===v) return true;
+  return false;
+}
 /* keep overlapping lead voices bounded: drop finished ones, and if rapid tapping has
-   stacked too many decaying tails, steal the oldest (it's already faded & masked) */
+   stacked too many decaying tails, steal the oldest FREE one (it's already faded & masked).
+   Voices still held by a finger are skipped, so a sustained chord is never cut short —
+   at worst we briefly exceed the cap while every voice is genuinely being played. */
 function capLeadVoices(keep){
   const now=AC.currentTime;
   for(let i=leadVoices.length-1;i>=0;i--) if(leadVoices[i].stopAt<=now) leadVoices.splice(i,1);
-  while(leadVoices.length>CONFIG.leadMaxVoices){
+  let guard=leadVoices.length;
+  while(leadVoices.length>CONFIG.leadMaxVoices && guard-->0){
     const old=leadVoices.shift();
-    if(old && old!==keep) killLead(old);
+    if(old===keep || isHeldVoice(old)){ leadVoices.push(old); continue; }  // still singing — spare it
+    killLead(old);
   }
 }
 function killLead(v){
@@ -2038,9 +2054,27 @@ const lead={ pid:null, x:0, y:0, downX:0, downY:0, lastT:0, t0:0, speed:0, hSpee
 let lastLeadMidi=null;   // the most recent note — held in the HUD after the finger lifts
 let flickCooldownUntil=0;// while a right-hand flick plays out, normal note logic is suppressed
 const leadVoices=[];     // every still-ringing lead voice (active + decaying tails), for the polyphony cap
+const leadExtra=new Map(); // pointerId → harmony finger {x,y,lastT,speed,voice,midi} (fingers beyond the primary)
 
+/* a fresh touch that lands right on top of a finger already down, within a blink, is a
+   capacitive ghost (down-up-down bounce, or a fat contact splitting into two points), not a
+   real note — two separate fingertips can't sit this close. Drop it so it can't double-fire. */
+function isGhostOnset(x,y){
+  const r=CONFIG.dupOnsetRadius, win=CONFIG.dupOnsetMs, now=performance.now();
+  if(lead.pid!==null && (now-lead.t0)<win && Math.hypot(x-lead.downX,y-lead.downY)<r) return true;
+  for(const f of leadExtra.values())
+    if((now-f.t0)<win && Math.hypot(x-f.x0,y-f.y0)<r) return true;
+  return false;
+}
 function leadDown(e){
-  if(!AC || lead.pid!==null) return;               // mono lead for now (left-hand zone = phase 3)
+  if(!AC) return;
+  if(isGhostOnset(e.clientX,e.clientY)) return;    // phantom double-tap from one finger — ignore
+  // the FIRST voice-zone finger is the primary (full vocabulary below); any finger while
+  // the primary is already down becomes a lighter harmony voice so chords can ring.
+  if(lead.pid!==null){
+    if(leadExtra.size < CONFIG.leadMaxFingers-1) extraDown(e);
+    return;
+  }
   lead.pid=e.pointerId; lead.x=e.clientX; lead.y=e.clientY; lead.downX=e.clientX; lead.downY=e.clientY;
   lead.lastT=lead.t0=performance.now(); lead.speed=0; lead.hSpeed=0; lead.pressure=e.pressure||0;
   flickCooldownUntil=0;
@@ -2129,6 +2163,74 @@ function leadUp(e){
   if(REC.leadBase!==null){midiLog(0,0xE0,0,64);midiLog(0,0x80,REC.leadBase,0);REC.leadBase=null;}
   if(lead.voice) releaseLead(lead.voice);
   lead.voice=null; lead.pid=null; lead.speed=0; lead.hSpeed=0;
+}
+
+/* ---- harmony fingers — polyphony beyond the primary voice ----
+   Each extra finger sings its own snapped note and glides on a slide, so several fingers
+   held at once form a chord. They deliberately skip the primary's richer vocabulary
+   (flick, the drawn line, MIDI pitch-bend) — bend is per-channel and would smear the
+   whole Voice track, so extras log plain discrete note-on/off instead. They still feed
+   note activity, so a fuller texture nudges leadIntensity up like denser single-note play. */
+function extraDown(e){
+  const y01=clamp(e.clientY/H,0,1), x01=clamp(e.clientX/W,0,1);
+  const midi=snapToAvailable(yToMidi(y01));
+  const voice=createLeadVoice(midi,x01);
+  noteOnsets.push(performance.now());
+  midiLog(0,0x90,midi,90);
+  const now=performance.now();
+  leadExtra.set(e.pointerId,{x:e.clientX,y:e.clientY,x0:e.clientX,y0:e.clientY,t0:now,lastT:now,speed:0,voice,midi,
+    stroke:[{x:e.clientX,y:e.clientY,t:now}]});   // its own sung thread, drawn like the primary's
+  ripple(x01,y01,midi, outness!==0&&!inScaleLead(midi)?OUT_COL:null);
+  tutorialNotify('voice');
+}
+function extraMove(e){
+  const f=leadExtra.get(e.pointerId); if(!f||!f.voice) return;
+  const now=performance.now(), dt=Math.max(now-f.lastT,1);
+  f.speed=Math.hypot(e.clientX-f.x,e.clientY-f.y)/dt;
+  f.x=e.clientX; f.y=e.clientY; f.lastT=now;
+  pushStrokePoint(f.stroke,e.clientX,e.clientY);           // draw this finger's thread too
+  const y01=clamp(e.clientY/H,0,1), x01=clamp(e.clientX/W,0,1);
+  const midi=snapToAvailable(yToMidi(y01),true);
+  if(midi!==f.voice.midi){
+    const leap=Math.abs(midi-f.voice.midi)>=CONFIG.leadLeapSemitones && f.speed>=CONFIG.leadLeapSpeed;
+    if(leap) rearticulateLead(f.voice,midi,x01); else glideLeadTo(f.voice,midi);
+    // MIDI stays discrete (no channel bend): retie the note whenever the snapped pitch moves
+    midiLog(0,0x80,f.midi,0); midiLog(0,0x90,midi,90); f.midi=midi;
+    // only a deliberate leap re-articulates → a ripple. A glide (a finger settling onto an
+    // adjacent snap right after landing) must NOT spawn a second ripple — that read as a
+    // phantom double-tap. Mirrors the primary's leadMove.
+    if(leap) ripple(x01,clamp((CONFIG.leadHi-midi)/(CONFIG.leadHi-CONFIG.leadLo),0,1),midi, outness!==0&&!inScaleLead(midi)?OUT_COL:null);
+  }
+  // timbre tracks horizontal position, same as the primary
+  const t=AC.currentTime;
+  f.voice.g2.gain.setTargetAtTime(lerp(timbre.sawLo,timbre.sawHi,x01),t,0.05);
+  f.voice.flt.frequency.setTargetAtTime(lerp(timbre.fltLo,timbre.fltHi,x01),t,0.05);
+}
+function extraUp(e){
+  const f=leadExtra.get(e.pointerId); if(!f) return;
+  if(f.voice) releaseLead(f.voice);
+  if(f.midi!=null) midiLog(0,0x80,f.midi,0);
+  if(f.stroke && f.stroke.length>1){ oldStrokes.push(f.stroke); if(oldStrokes.length>12) oldStrokes.shift(); }  // let the thread linger & fade
+  leadExtra.delete(e.pointerId);
+}
+/* release every harmony finger's voice (used by reset / panic / voice-switch) */
+function killExtras(){
+  for(const f of leadExtra.values()){ if(f.voice){ try{releaseLead(f.voice);}catch(_){} } }
+  leadExtra.clear();
+}
+/* the left-hand outness morph bends the primary; keep held harmony fingers coherent by
+   re-snapping each at its own height (audio only — MIDI for extras stays discrete). */
+function retuneExtras(){
+  const t=AC.currentTime;
+  for(const f of leadExtra.values()){
+    if(!f.voice) continue;
+    const midi=snapToAvailable(yToMidi(clamp(f.y/H,0,1)),true);
+    if(midi!==f.voice.midi){
+      f.voice.o1.frequency.setTargetAtTime(mtof(midi),t,0.03);
+      f.voice.o2.frequency.setTargetAtTime(mtof(midi),t,0.03);
+      f.voice.midi=midi;
+    }
+  }
 }
 
 /* leadIntensity = finger speed + register + note-onset activity (+ pressure).
@@ -2360,6 +2462,7 @@ function leftMove(e){
         ripple(clamp(lead.x/W,0,1),y01,midi, !inScaleLead(midi)?OUT_COL:null);
       }
     }
+    retuneExtras();   // keep a held chord coherent with the primary's outness bend
     dbg('OUT '+(outness>=0?'♯':'♭')+' '+outness.toFixed(2));
   }
 }
@@ -2384,6 +2487,7 @@ function leftUp(e){
     }
   }
   // outness snaps back to inside on release — the side-slip resolves
+  const wasOut = outness!==0;
   if(outness!==0 && lead.voice && lead.pid!==null){
     outness=0;
     const y01=clamp(lead.y/H,0,1);
@@ -2407,6 +2511,7 @@ function leftUp(e){
       ripple(clamp(lead.x/W,0,1),y01,midi,null);
     }
   } else { outness=0; }
+  if(wasOut) retuneExtras();   // resolve any held chord back inside alongside the primary
   left.pid=null; left.mode='idle';
 }
 
@@ -2495,7 +2600,8 @@ const ripples=[];     // a ring at each note onset / leap
 const parts=[];       // NIGHT LANGUAGE-style particle burst (used by the outside flick)
 const OUT_COL=[180,212,255];   // NIGHT LANGUAGE's blue-white "outside" colour
 
-function pushTrail(x,y){ leadStroke.push({x,y,t:performance.now()}); if(leadStroke.length>120) leadStroke.shift(); }
+function pushStrokePoint(stroke,x,y){ stroke.push({x,y,t:performance.now()}); if(stroke.length>120) stroke.shift(); }
+function pushTrail(x,y){ pushStrokePoint(leadStroke,x,y); }
 // freeze the active stroke so it fades on its own; don't connect the next note to it
 function breakTrail(){ if(leadStroke.length>1) oldStrokes.push(leadStroke); leadStroke=[]; if(oldStrokes.length>12) oldStrokes.shift(); }
 // discard the active stroke outright — a flick draws a particle burst, never a line
@@ -2729,6 +2835,19 @@ function frame(){
     cx.shadowColor='rgba(255,179,92,0.9)'; cx.shadowBlur=lerp(10,28,leadIntensity);
     cx.fill(); cx.shadowBlur=0;
   }
+  // harmony fingers each draw their own live thread + tip glow, same as the primary
+  for(const f of leadExtra.values()){
+    const st=f.stroke; if(!st) continue;
+    while(st.length && now-st[0].t>1200) st.shift();
+    if(st.length>1) drawStroke(st);
+    if(f.voice && st.length){
+      const tip=st[st.length-1];
+      cx.beginPath();cx.arc(tip.x,tip.y,lerp(6,16,leadIntensity),0,7);
+      cx.fillStyle=`rgba(${lr},${lg},${lb},0.85)`;
+      cx.shadowColor='rgba(255,179,92,0.9)'; cx.shadowBlur=lerp(10,28,leadIntensity);
+      cx.fill(); cx.shadowBlur=0;
+    }
+  }
 
   // tutorial ghost — demonstrate the narrow-zone left-hand swipes (temp / scrub)
   drawTutorialGhost(now);
@@ -2839,10 +2958,12 @@ function routeMove(e){
   e.preventDefault();
   if(e.pointerId===left.pid) leftMove(e);
   else if(e.pointerId===lead.pid) leadMove(e);
+  else if(leadExtra.has(e.pointerId)) extraMove(e);
 }
 function routeEnd(e){
   if(e.pointerId===left.pid) leftUp(e);
   else if(e.pointerId===lead.pid) leadUp(e);
+  else if(leadExtra.has(e.pointerId)) extraUp(e);
 }
 cv.addEventListener('pointerdown',routeDown);
 cv.addEventListener('pointermove',routeMove);
@@ -2898,6 +3019,7 @@ function switchStyle(i){
     padVoices.forEach(v=>{ v.oscs.forEach(o=>{try{o.stop();}catch(_){}}); });
     padVoices=[];
     if(lead.voice){ try{releaseLead(lead.voice);}catch(_){} lead.voice=null; lead.pid=null; }
+    killExtras();
     setStyle(i);
     syncBpm();
     setTimeout(()=>{
