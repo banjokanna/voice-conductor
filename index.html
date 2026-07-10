@@ -817,8 +817,8 @@ function encodeMIDI(events,bpm,ppq){
   // group by channel
   const chans=new Map();
   sorted.forEach(e=>{if(!chans.has(e.ch))chans.set(e.ch,[]);chans.get(e.ch).push(e);});
-  const trackNames={0:'Voice',1:'Bass',2:'Pad',3:'Piano',4:'Comp',9:'Drums'};
-  const programs={0:26,1:32,2:89,3:0,4:0}; // 26=jazz guitar, 32=acoustic bass, 89=pad, 0=piano
+  const trackNames={0:'Voice',1:'Bass',2:'Pad',3:'Piano',4:'Comp',5:'Voice 2',6:'Voice 3',7:'Voice 4',9:'Drums'};
+  const programs={0:26,1:32,2:89,3:0,4:0,5:26,6:26,7:26}; // 26=jazz guitar (harmony fingers match the Voice), 32=bass, 89=pad, 0=piano
   function buildTrack(ch,evts){
     const d=[];
     // track name
@@ -975,6 +975,8 @@ function stopRecording(){
   }
   if(REC.state!=='recording') return;
   if(REC.leadBase!==null){midiLog(0,0xE0,0,64);midiLog(0,0x80,REC.leadBase,0);REC.leadBase=null;}
+  // close out any harmony fingers still held at stop, else their note-ons hang to end of track
+  for(const f of leadExtra.values()) if(f.midi!=null){ midiLog(f.mch,0x80,f.midi,0); f.midi=null; }
   REC.state='stopped';
   recBtn.textContent='● REC';
   gearEl.classList.remove('rec'); recLabel.style.display='none';
@@ -2168,17 +2170,26 @@ function leadUp(e){
 /* ---- harmony fingers — polyphony beyond the primary voice ----
    Each extra finger sings its own snapped note and glides on a slide, so several fingers
    held at once form a chord. They deliberately skip the primary's richer vocabulary
-   (flick, the drawn line, MIDI pitch-bend) — bend is per-channel and would smear the
-   whole Voice track, so extras log plain discrete note-on/off instead. They still feed
-   note activity, so a fuller texture nudges leadIntensity up like denser single-note play. */
+   (flick, the drawn line). For MIDI, each harmony finger records on its OWN channel
+   (HARM_CH), never the primary's ch0: that keeps the primary's per-channel pitch-bend
+   from smearing the chord, and stops two fingers on the same note number from cancelling
+   each other's note-off. Harmony voices glide as discrete re-tied notes (no bend of their
+   own). They still feed note activity, so a fuller texture nudges leadIntensity up. */
+const HARM_CH=[5,6,7];    // spare MIDI channels for harmony fingers (leadMaxFingers-1 of them)
+function allocHarmCh(){
+  const used=new Set([...leadExtra.values()].map(f=>f.mch));
+  for(const c of HARM_CH) if(!used.has(c)) return c;
+  return HARM_CH[HARM_CH.length-1];   // fingers are capped at HARM_CH.length, so a free one always exists
+}
 function extraDown(e){
   const y01=clamp(e.clientY/H,0,1), x01=clamp(e.clientX/W,0,1);
   const midi=snapToAvailable(yToMidi(y01));
   const voice=createLeadVoice(midi,x01);
+  const mch=allocHarmCh();
   noteOnsets.push(performance.now());
-  midiLog(0,0x90,midi,90);
+  midiLog(mch,0x90,midi,90);
   const now=performance.now();
-  leadExtra.set(e.pointerId,{x:e.clientX,y:e.clientY,x0:e.clientX,y0:e.clientY,t0:now,lastT:now,speed:0,voice,midi,
+  leadExtra.set(e.pointerId,{x:e.clientX,y:e.clientY,x0:e.clientX,y0:e.clientY,t0:now,lastT:now,speed:0,voice,midi,mch,
     stroke:[{x:e.clientX,y:e.clientY,t:now}]});   // its own sung thread, drawn like the primary's
   ripple(x01,y01,midi, outness!==0&&!inScaleLead(midi)?OUT_COL:null);
   tutorialNotify('voice');
@@ -2194,8 +2205,8 @@ function extraMove(e){
   if(midi!==f.voice.midi){
     const leap=Math.abs(midi-f.voice.midi)>=CONFIG.leadLeapSemitones && f.speed>=CONFIG.leadLeapSpeed;
     if(leap) rearticulateLead(f.voice,midi,x01); else glideLeadTo(f.voice,midi);
-    // MIDI stays discrete (no channel bend): retie the note whenever the snapped pitch moves
-    midiLog(0,0x80,f.midi,0); midiLog(0,0x90,midi,90); f.midi=midi;
+    // MIDI stays discrete (no channel bend): retie the note on this finger's own channel
+    midiLog(f.mch,0x80,f.midi,0); midiLog(f.mch,0x90,midi,90); f.midi=midi;
     // only a deliberate leap re-articulates → a ripple. A glide (a finger settling onto an
     // adjacent snap right after landing) must NOT spawn a second ripple — that read as a
     // phantom double-tap. Mirrors the primary's leadMove.
@@ -2209,13 +2220,17 @@ function extraMove(e){
 function extraUp(e){
   const f=leadExtra.get(e.pointerId); if(!f) return;
   if(f.voice) releaseLead(f.voice);
-  if(f.midi!=null) midiLog(0,0x80,f.midi,0);
+  if(f.midi!=null) midiLog(f.mch,0x80,f.midi,0);
   if(f.stroke && f.stroke.length>1){ oldStrokes.push(f.stroke); if(oldStrokes.length>12) oldStrokes.shift(); }  // let the thread linger & fade
   leadExtra.delete(e.pointerId);
 }
-/* release every harmony finger's voice (used by reset / panic / voice-switch) */
+/* release every harmony finger's voice (used by reset / panic / voice-switch).
+   Close each held note in MIDI too, so a voice-switch mid-recording can't leave it hanging. */
 function killExtras(){
-  for(const f of leadExtra.values()){ if(f.voice){ try{releaseLead(f.voice);}catch(_){} } }
+  for(const f of leadExtra.values()){
+    if(f.midi!=null) midiLog(f.mch,0x80,f.midi,0);
+    if(f.voice){ try{releaseLead(f.voice);}catch(_){} }
+  }
   leadExtra.clear();
 }
 /* the left-hand outness morph bends the primary; keep held harmony fingers coherent by
